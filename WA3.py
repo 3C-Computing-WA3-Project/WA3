@@ -20,11 +20,13 @@ from IPython.display import clear_output, display
 import time
 from google.colab import userdata
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional
 from beanie import init_beanie, Document, Indexed
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 
-from datetime import date
+from datetime import datetime
 
 import random
 
@@ -40,16 +42,18 @@ class UserModel(Document):
     class Settings:
         collection = "UserModel"
 
-class Quiz(BaseModel):
-    question: str
+class QuestionModel(Document):
+    question: Indexed(str, unique=True)
     solution: str
     answer: str
-
-class QuestionModel(Document):
-    ownerId: str
     title: str
-    question: Quiz
-    dateStamp: date = Field(default_factory=date.today)
+    class Settings:
+        collection = "QuestionsBank"
+
+class AttemptModel(Document):
+    userId: str
+    questionId: str
+    timeStamp: datetime = Field(default_factory=datetime.now)
     isCorrect: bool = False
     '''
     Every submission counts just before it is answered correctly.
@@ -57,9 +61,12 @@ class QuestionModel(Document):
     '''
     timesOfAnswering: int = 1
     class Settings:
-        collection = "QuestionModel"
+        collection = "AttemptModel"
 
-
+class Quiz(BaseModel):
+    question: str
+    answer: str
+    solution: str
 ############################## End of Data Models ##############################
 
 ############################## Nerfed MVC framework ##############################
@@ -101,14 +108,14 @@ class ViewBase():
                         cls.widgetsattr[f"{name}_index_{index}"] = widget_val
                         cls.renderlist.append(widget_val)
 
-    def __init__(self, appstate=None):
+    def __init__(self, appstate):
         self.appstate = appstate
-        self.widgets_attr_dict = self.__class__.widgetsattr
+        self.widgets_attr_dict = self.__class__.widgetsattr.copy()
 
         for name, widget in self.widgets_attr_dict.items():
             setattr(self, name, widget)
 
-        self.widgets = self.__class__.renderlist
+        self.widgets = self.__class__.renderlist.copy()
         self.link()
 
     def to_render(self) -> widgets.VBox:
@@ -143,9 +150,16 @@ class ControllerBase(ABC):
     def __init__(self, appstate, router):
         self.appstate = appstate
         self.router = router
-        if not (hasattr(self, "view") and isinstance(self.view, ViewBase)):
-            raise AttributeError("Invalid view type")
-        for name, widget in self.view.__class__.__dict__.items():
+
+        self._obj_view = getattr(self, "_obj_view", None)
+        if not isinstance(self._obj_view, type):
+            raise AttributeError("No view _obj_view detected.")
+
+        if not issubclass(self._obj_view, ViewBase):
+            raise TypeError(f"Invalid _obj_view attr. Required ViewBase subclass, got {type(self._obj_view)}")
+
+    def binding(self):
+        for name, widget in self.view.widgets_attr_dict.items():
             func = None
 
             if isinstance(widget, widgets.Button):
@@ -153,6 +167,7 @@ class ControllerBase(ABC):
             else:
                 continue
 
+            widget._click_handlers.callbacks.clear()
             if inspect.iscoroutinefunction(func):
                 async def wrapper(_, f=func, w=widget):
                     w.disabled = True
@@ -169,6 +184,8 @@ class ControllerBase(ABC):
                 widget.on_click(wrapper)
 
     def show(self):
+        self.view = self._obj_view(self.appstate)
+        self.binding()
         self.router.container.clear_output()
         with self.router.container:
             display(self.view.to_render())
@@ -177,7 +194,7 @@ class AppState(HasTraits):
     '''
     Dynamic app data
     '''
-    userid = Unicode()
+    userId = Unicode()
     name = Unicode()
 
 class Router:
@@ -210,15 +227,31 @@ class QuizHelper:
     '''
     the 'question' argument must be a calleable function which returns the quiz class
     '''
-    def __init__(self, *, appstate, quiz:Quiz, title:str, numberOfQuestions = 5):
+    def __init__(self, *, appstate, quiz, title:str, numberOfQuestions = 5):
         self.quiz=quiz
         self.title=title
         self.numberOfQuestions=numberOfQuestions
         self.appstate=appstate
 
-    def build_ui(self):
+    async def build_ui(self):
+        question_list = []
         for x in range(self.numberOfQuestions):
-            quiz_obj = self.quiz()
+            quiz_obj = None
+            questionid = ""
+            while(True):
+                try:
+                    quiz_obj = self.quiz()
+                    question_model = QuestionModel(
+                        question = quiz_obj.question,
+                        solution = quiz_obj.solution,
+                        answer = quiz_obj.answer,
+                        title = self.title
+                        )
+                    await question_model.insert()
+                    questionid = str(question_model.id)
+                    break
+                except DuplicateKeyError:
+                    pass
 
             ask = widgets.HTML(f"<strong>{quiz_obj.question}</strong>")
 
@@ -260,22 +293,21 @@ class QuizHelper:
             )
             # Creation of variable after instantiation
             submit_btn.isSubmitted = False
-            submit_btn.questionModel = QuestionModel(
-                ownerId = self.appstate.userid,
-                title = self.title,
-                question = quiz_obj,
+            submit_btn.attempt_model = AttemptModel(
+                userId = self.appstate.userId,
+                questionId = questionid,
                 isCorrect = False
             )
             async def submit(
                 *,
-                myself,
+                event,
                 w_quiz_obj,
                 w_answer,
                 w_correct,
                 w_incorrect,
                 w_show_solution_btn
             ):
-                myself.disabled = True
+                event.disabled = True
                 isCorrect = w_answer.value.strip() == w_quiz_obj.answer
                 w_correct.layout.display="none"
                 w_incorrect.layout.display="none"
@@ -286,19 +318,19 @@ class QuizHelper:
                     w_incorrect.layout.display=""
                     w_show_solution_btn.layout.display=""
 
-                if not myself.isSubmitted:
-                    myself.questionModel.isCorrect = isCorrect
-                    await myself.questionModel.insert()
+                if not event.isSubmitted:
+                    event.attempt_model.isCorrect = isCorrect
+                    await event.attempt_model.insert()
                 else:
-                    prev = myself.questionModel.isCorrect
-                    myself.questionModel.isCorrect = isCorrect or myself.questionModel.isCorrect
-                    myself.questionModel.timesOfAnswering += 1 if not prev else 0
-                    await myself.questionModel.save()
-                myself.isSubmitted = True
-                myself.disabled = False
+                    prev = event.attempt_model.isCorrect
+                    event.attempt_model.isCorrect = isCorrect or event.attempt_model.isCorrect
+                    event.attempt_model.timesOfAnswering += 1 if not prev else 0
+                    await event.attempt_model.save()
+                event.isSubmitted = True
+                event.disabled = False
 
             submit_btn.on_click(
-                lambda myself,
+                lambda event,
                 w_quiz_obj=quiz_obj,
                 w_answer=answer,
                 w_incorrect=incorrect,
@@ -306,7 +338,7 @@ class QuizHelper:
                 w_show_solution_btn=show_solution_btn:
             loop.run_until_complete(
                 submit(
-                    myself=myself,
+                    event=event,
                     w_quiz_obj=w_quiz_obj,
                     w_answer=w_answer,
                     w_correct=w_correct,
@@ -322,7 +354,9 @@ class QuizHelper:
                 padding="1em",
                 margin="1em 0"
             ))
-            yield quiz_container
+            question_list.append(quiz_container)
+
+        return question_list # To make my life easier, I omitted yield keyword
 
 def make_title(text, _layout=None):
     return widgets.HTML(f"<h1 style='color: teal'>{text}</h1>",layout=_layout if _layout is not None else widgets.Layout(
@@ -352,7 +386,7 @@ class MainMenuView(ViewBase):
 
 class MainMenuController(ControllerBase):
     def __init__(self, appstate, router):
-        self.view = MainMenuView()
+        self._obj_view = MainMenuView
         super().__init__(appstate, router)
 
     def on_btn_login(self, event):
@@ -434,14 +468,13 @@ class RegisterView(ViewBase):
 
 class RegisterController(ControllerBase):
     def __init__(self, appstate, router):
-        self.view = RegisterView()
+        self._obj_view = RegisterView
         super().__init__(appstate, router)
 
     def on_btn_exit(self, event):
         self.router.go(MainMenuController)
 
     async def on_btn_register(self, event):
-        from pymongo.errors import DuplicateKeyError
         try:
             self.view.error_text_password_not_match.layout.display = "none"
             self.view.error_text_password_length.layout.display = "none"
@@ -468,7 +501,7 @@ class RegisterController(ControllerBase):
                 username=self.view.username.value,
                 hashedPassword=hashed
             )
-
+            self.data = data
             await data.insert()
             self.view.succeeded.layout.display = ""
 
@@ -515,11 +548,11 @@ class LoginView(ViewBase):
 
 class LoginController(ControllerBase):
     def __init__(self, appstate, router):
-        self.view = LoginView()
+        self._obj_view = LoginView
         super().__init__(appstate, router)
 
     def on_btn_exit(self, event):
-         self.router.go(MainMenuController)
+        self.router.go(MainMenuController)
 
     async def on_btn_login(self, event):
         self.view.error_text.layout.display = "none"
@@ -539,7 +572,7 @@ class LoginController(ControllerBase):
         isAuth = bcrypt.checkpw(pwd.encode("utf-8"), hash) and result is not None
         if isAuth:
             self.appstate.name = result.name
-            self.appstate.userid = str(result.id)
+            self.appstate.userId = str(result.id)
             self.router.go(DashboardController)
         else:
             self.view.error_text.layout.display = ""
@@ -613,7 +646,7 @@ class DashboardView(ViewBase):
 
 class DashboardController(ControllerBase):
     def __init__(self, appstate, router):
-        self.view = DashboardView(appstate)
+        self._obj_view = DashboardView
         super().__init__(appstate, router)
 
     def on_btn_sign_out(self, event):
@@ -636,22 +669,25 @@ class QuadraticEquationsView(ViewBase):
     )
 
     def link(self):
-        self.widgets.extend(
+        new_widgets = loop.run_until_complete(
             QuizHelper(
                 appstate=self.appstate,
                 quiz=self.quiz_generator,
-                title="Quadratic Equation").build_ui())
+                title="Quadratic Equation"
+            ).build_ui()
+        )
+        self.widgets.extend(new_widgets)
 
     def quiz_generator(self):
         return Quiz(
-            question = "Sample Quadratic Equation Question",
+            question = "Sample Quadratic Equation Question"+ str(random.randint(0, 1000)),
             solution = "Sample Quadratic Equation Solution",
             answer = "answer"
         )
 
 class QuadraticEquationsController(ControllerBase):
     def __init__(self, appstate, router):
-        self.view = QuadraticEquationsView(appstate)
+        self._obj_view = QuadraticEquationsView
         super().__init__(appstate, router)
 
     def on_exit_btn(self, event):
@@ -663,7 +699,7 @@ print("Trying to connect to the database...")
 # Create a new client and connect to the server
 client = AsyncIOMotorClient(userdata.get("MongoDBAtlasConnectionString")) # The connection string will be revoked after WA3 is graded
 
-await init_beanie(database=client["WA3"], document_models=[UserModel, QuestionModel])
+await init_beanie(database=client["WA3"], document_models=[UserModel, QuestionModel, AttemptModel])
 await client.admin.command('ping')
 
 print("Connected!")
